@@ -16,12 +16,7 @@ from PIL import Image, ImageStat
 from model import MaxViT
 import uvicorn
 
-# Try to load keys from the adjacent Next.js folder
-env_path = os.path.join(os.path.dirname(__file__), "../tomatoguard-ai/.env.local")
-if os.path.exists(env_path):
-    load_dotenv(env_path)
-else:
-    load_dotenv()
+load_dotenv()
 
 app = FastAPI(title="TomatoGuard AI Inference Engine")
 
@@ -97,7 +92,17 @@ def init_db():
             )
         """)
         
-        # 2. Migration: image_path -> image_url
+        # 2. Ensure analytics table exists
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS analytics (
+                id           SERIAL PRIMARY KEY,
+                disease_name TEXT UNIQUE,
+                count        INTEGER DEFAULT 0,
+                last_detected TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 3. Migration: image_path -> image_url
         try:
             c.execute("ALTER TABLE history RENAME COLUMN image_path TO image_url")
             print("🚀 Migrated column: image_path -> image_url")
@@ -462,6 +467,7 @@ async def predict(image: UploadFile = File(...)):
             try:
                 conn = psycopg2.connect(DATABASE_URL)
                 c = conn.cursor()
+                # 1. Insert history record
                 c.execute("""
                     INSERT INTO history
                     (id, prediction, confidence, created_at, image_url,
@@ -476,6 +482,14 @@ async def predict(image: UploadFile = File(...)):
                     image_analysis["brightness"], image_analysis["dominant_color"],
                     method
                 ))
+
+                # 2. Upsert analytics count
+                c.execute("""
+                    INSERT INTO analytics (disease_name, count, last_detected)
+                    VALUES (%s, 1, %s)
+                    ON CONFLICT (disease_name)
+                    DO UPDATE SET count = analytics.count + 1, last_detected = %s
+                """, (prediction, timestamp, timestamp))
                 conn.commit()
                 conn.close()
             except Exception as db_err:
