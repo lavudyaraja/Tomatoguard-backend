@@ -36,7 +36,7 @@ app.add_middleware(
 )
 
 # ── CONFIGURATION ──────────────────────────────────────────────
-MODEL_PATH = os.getenv("MODEL_PATH", "../maxvit_kaggle_best.pth")
+MODEL_PATH = os.getenv("MODEL_PATH", "./maxvit_kaggle_best.pth")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CLASSES = [
@@ -138,10 +138,13 @@ if os.path.exists(MODEL_PATH):
             print("✅ MaxViT weights loaded successfully.")
         else:
             print(f"⚠️  Model file at {MODEL_PATH} is too small — skipping.")
+            weights_loaded = False
     except Exception as e:
         print(f"❌ Error loading model weights: {e}")
+        weights_loaded = False
 else:
-    print(f"⚠️  Checkpoint not found at {MODEL_PATH}. Using heuristic fallback.")
+    print(f"❌ Checkpoint not found at {MODEL_PATH}. Deep learning model failed to load!")
+    weights_loaded = False
 
 model.to(DEVICE)
 model.eval()
@@ -263,94 +266,6 @@ def _quality_warnings(w, h, brightness, contrast, size_kb):
     return warnings
 
 
-# ── CLASS NAME → PREDICTION MATCHING ─────────────────────────
-_FILENAME_ABBR = {
-    "erly.b":    "Early_blight",
-    "early_b":   "Early_blight",
-    "late.b":    "Late_blight",
-    "late_b":    "Late_blight",
-    "spm":       "Spider_mites_Two-spotted_spider_mite",
-    "sept.l":    "Septoria_leaf_spot",
-    "septoria":  "Septoria_leaf_spot",
-    "b_spot":    "Bacterial_spot",
-    "b.spot":    "Bacterial_spot",
-    "bac_s":     "Bacterial_spot",
-    "target":    "Target_Spot",
-    "ylcv":      "Tomato_Yellow_Leaf_Curl_Virus",
-    "curl":      "Tomato_Yellow_Leaf_Curl_Virus",
-    "yellow_l":  "Tomato_Yellow_Leaf_Curl_Virus",
-    "mosaic":    "Tomato_mosaic_virus",
-    "tmv":       "Tomato_mosaic_virus",
-    "mold":      "Leaf_Mold",
-    "l_mold":    "Leaf_Mold",
-    "hlty":      "healthy",
-    "h_plant":   "healthy",
-    "pm":        "powdery_mildew",
-    "powdery":   "powdery_mildew",
-}
-
-def _heuristic_predict(img_data: bytes, filename: str, image_analysis: dict):
-    """
-    Deterministic heuristic prediction used when model weights are unavailable.
-    Priority: (1) filename abbreviation → (2) full class name in filename →
-              (3) visual color analysis of the image.
-    """
-    fname = filename.lower() if filename else ""
-    normalized = fname.replace("-", "_").replace(" ", "_")
-
-    # 1. Abbreviation match
-    for abbr, cls in _FILENAME_ABBR.items():
-        if abbr in fname:
-            return cls, "filename_abbreviation"
-
-    # 2. Full class name match
-    for cls in CLASSES:
-        if cls.lower().replace("-", "_") in normalized:
-            return cls, "filename_class_match"
-
-    # 3. Visual heuristic using analyzed image stats
-    dom = image_analysis["dominant_color"]
-    green_pct = image_analysis["green_coverage_pct"]
-    brightness = image_analysis["brightness"]
-    contrast = image_analysis["contrast"]
-
-    if dom == "green" and green_pct > 50:
-        prediction = "healthy"
-    elif dom == "white-gray" or (image_analysis["channel_means"]["R"] > 200
-                                  and image_analysis["channel_means"]["G"] > 200):
-        prediction = "powdery_mildew"
-    elif dom == "yellow-red":
-        prediction = "Tomato_Yellow_Leaf_Curl_Virus"
-    elif dom == "red-brown":
-        if contrast > 30:
-            prediction = "Late_blight"
-        else:
-            prediction = "Early_blight"
-    elif dom == "dark":
-        prediction = "Late_blight"
-    else:
-        # Final fallback using hash for deterministic variety across unknowns
-        h = int(hashlib.md5(img_data).hexdigest(), 16)
-        prediction = CLASSES[h % len(CLASSES)]
-
-    return prediction, "visual_heuristic"
-
-
-def _build_fake_top5(prediction: str, confidence: float):
-    """Build a plausible top-5 probability distribution for heuristic mode."""
-    pred_idx = CLASSES.index(prediction)
-    top_idx = [pred_idx]
-    top_prob = [confidence]
-
-    # Distribute remaining probability over 4 random-ish classes
-    remaining = [(1.0 - confidence)]
-    others = [i for i in range(len(CLASSES)) if i != pred_idx]
-    weights = [0.40, 0.25, 0.20, 0.15]
-    for j, w in zip(others[:4], weights):
-        top_idx.append(j)
-        top_prob.append(round((1.0 - confidence) * w, 4))
-
-    return top_idx, top_prob
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────
@@ -396,30 +311,21 @@ async def predict(image: UploadFile = File(...)):
         image_analysis = analyze_image(img, img_data, image.filename)
 
         # ── Run inference ──
-        if weights_loaded:
-            input_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
-            with torch.no_grad():
-                outputs = model(input_tensor)
-                probs = torch.softmax(outputs, dim=1)[0]
+        if not weights_loaded:
+            raise HTTPException(status_code=503, detail="Deep learning model weights are missing on the server.")
 
-            top_prob_tensor, top_idx_tensor = torch.topk(probs, 5)
-            top_prob = [round(p, 6) for p in top_prob_tensor.tolist()]
-            top_idx = top_idx_tensor.tolist()
+        input_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            outputs = model(input_tensor)
+            probs = torch.softmax(outputs, dim=1)[0]
 
-            prediction = CLASSES[top_idx[0]]
-            confidence = top_prob[0]
-            method = "maxvit_inference"
+        top_prob_tensor, top_idx_tensor = torch.topk(probs, 5)
+        top_prob = [round(p, 6) for p in top_prob_tensor.tolist()]
+        top_idx = top_idx_tensor.tolist()
 
-        else:
-            prediction, method = _heuristic_predict(img_data, image.filename, image_analysis)
-
-            # Deterministic confidence in [0.85, 0.99] with 1000 distinct buckets
-            md5_hash = hashlib.md5(img_data).hexdigest()
-            h_val = int(md5_hash, 16)
-            confidence = round(0.85 + (h_val % 1000) / 7142.8, 4) 
-            print(f"DEBUG: Filename={image.filename}, MD5={md5_hash}, Confidence={confidence}")
-
-            top_idx, top_prob = _build_fake_top5(prediction, confidence)
+        prediction = CLASSES[top_idx[0]]
+        confidence = top_prob[0]
+        method = "maxvit_inference"
 
         # ── Build top-5 result list ──
         top5 = [
