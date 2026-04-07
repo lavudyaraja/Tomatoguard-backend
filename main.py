@@ -428,6 +428,8 @@ async def predict(image: UploadFile = File(...)):
         ]
 
         # ── PERSISTENCE: Save to Cloudinary (fallback to Base64) ──
+        pred_id = str(uuid.uuid4())
+        timestamp = datetime.datetime.now().isoformat()
         persistent_image_url = None
         is_cloudinary_active = bool(os.getenv("CLOUDINARY_CLOUD_NAME") and os.getenv("CLOUDINARY_CLOUD_NAME") != "your_cloud_name")
 
@@ -454,8 +456,6 @@ async def predict(image: UploadFile = File(...)):
             except Exception:
                 persistent_image_url = None
 
-        pred_id = str(uuid.uuid4())
-        timestamp = datetime.datetime.now().isoformat()
 
         # ── Save to DB ──
         if DATABASE_URL:
