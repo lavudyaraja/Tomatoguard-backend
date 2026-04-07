@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+torch==2.2.2
+torchvision==0.17.2
+Pillow
+psycopg2-binary
+python-dotenv
+python-multipart

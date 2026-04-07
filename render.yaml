@@ -1,0 +1,18 @@
+# render.yaml — Native Python deployment on Render.com (no Docker)
+# Docs: https://render.com/docs/render-yaml-spec
+
+services:
+  - type: web
+    name: tomatoguard-backend
+    runtime: python
+    region: ohio          # closest to Neon us-east-1
+    plan: free            # upgrade to starter ($7/mo) for always-on
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false       # set manually in Render → Environment tab
+      - key: MODEL_PATH
+        value: ./maxvit_kaggle_best.pth
+      - key: PYTHON_VERSION
+        value: "3.11.0"
