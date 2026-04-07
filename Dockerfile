@@ -10,18 +10,23 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Hugging Face Spaces use UID 1000
+RUN useradd -m -u 1000 user
+USER user
+ENV PATH="/home/user/.local/bin:$PATH"
+
+WORKDIR /app
+
 # Copy requirements and install
-# We use torch-cpu to save massive amounts of RAM
-COPY requirements.txt .
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+COPY --chown=user requirements.txt .
+RUN pip install --no-cache-dir --user --extra-index-url https://download.pytorch.org/whl/cpu \
     -r requirements.txt
 
 # Copy the rest of the application
-COPY . .
+COPY --chown=user . .
 
 # Hugging Face Spaces listen on port 7860 by default
 EXPOSE 7860
 
 # Start the FastAPI engine
-# We use --host 0.0.0.0 to ensure the container is reachable
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
