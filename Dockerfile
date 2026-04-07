@@ -19,10 +19,9 @@ RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/wh
 # Copy the rest of the application
 COPY . .
 
-# Hugging Face Spaces (and most other cloud providers) listen on port 7860 by default
-# But we can override this in our main.py or CMD
-EXPOSE 8000
+# Hugging Face Spaces listen on port 7860 by default
+EXPOSE 7860
 
 # Start the FastAPI engine
 # We use --host 0.0.0.0 to ensure the container is reachable
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
