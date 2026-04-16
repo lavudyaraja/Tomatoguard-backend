@@ -1,4 +1,13 @@
-<<<<<<< HEAD
+---
+title: TomatoGuard AI Backend
+emoji: 🚀
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_file: main.py
+pinned: false
+---
+
 # 🧠 TomatoGuard AI Backend
 
 This is the high-performance **Inference Engine** for the TomatoGuard AI ecosystem. It uses Deep Learning to diagnose tomato diseases from images with high accuracy.
@@ -38,16 +47,3 @@ uvicorn main:app --reload --port 8000
 ```
 
 *Protecting your crops with the power of Machine Intelligence.*
-=======
----
-title: Tomato Disease Classifier
-emoji: 📉
-colorFrom: purple
-colorTo: blue
-sdk: docker
-pinned: false
-short_description: AI-powered Tomato Leaf Disease Detection using MaxViT
----
-
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
->>>>>>> 0e47c30e6bb6f04d6a7dd0eb59ffe4a4e41848ac
