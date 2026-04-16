@@ -110,6 +110,7 @@ def init_db():
             ("history", "hotspots", "TEXT"),
             ("history", "llm_insight", "TEXT"),
             ("history", "image_info", "TEXT"),
+            ("history", "models", "TEXT"),
             ("analytics", "severity", "TEXT")
         ]
         
@@ -176,32 +177,47 @@ weights_loaded = {
 # 1. Initialize CoAtNet
 print("🏗️  Initializing CoAtNet model...")
 model_coatnet = create_coatnet(num_classes=len(CLASSES))
-if os.path.exists(COATNET_PATH):
-    try:
-        checkpoint = torch.load(COATNET_PATH, map_location=DEVICE)
-        sd = checkpoint.get('model_state_dict', checkpoint.get('sd', checkpoint))
-        model_coatnet.load_state_dict(sd)
-        model_coatnet.to(DEVICE)
-        model_coatnet.eval()
-        weights_loaded["coatnet"] = True
-        print("✅ CoAtNet weights loaded.")
-    except Exception as e:
-        print(f"❌ Error loading CoAtNet: {e}")
+_coatnet_path_candidates = [
+    COATNET_PATH,
+    "./best_coatnet_model.pth",
+    "../best_coatnet_checkpoint.pt",
+    "./best_coatnet_checkpoint.pt",
+]
+for _candidate in _coatnet_path_candidates:
+    if os.path.exists(_candidate):
+        try:
+            checkpoint = torch.load(_candidate, map_location=DEVICE)
+            sd = checkpoint.get('model_state_dict', checkpoint.get('sd', checkpoint))
+            model_coatnet.load_state_dict(sd)
+            model_coatnet.to(DEVICE)
+            model_coatnet.eval()
+            weights_loaded["coatnet"] = True
+            print(f"✅ CoAtNet weights loaded from {_candidate}.")
+            break
+        except Exception as e:
+            print(f"❌ Error loading CoAtNet from {_candidate}: {e}")
 
 # 2. Initialize MaxViT
 print("🏗️  Initializing MaxViT model...")
 model_maxvit = MaxViT(num_classes=len(CLASSES), win=7, drop_path_rate=0.15)
-if os.path.exists(MAXVIT_PATH):
-    try:
-        checkpoint = torch.load(MAXVIT_PATH, map_location=DEVICE)
-        sd = checkpoint.get('model_state_dict', checkpoint.get('sd', checkpoint))
-        model_maxvit.load_state_dict(sd)
-        model_maxvit.to(DEVICE)
-        model_maxvit.eval()
-        weights_loaded["maxvit"] = True
-        print("✅ MaxViT weights loaded.")
-    except Exception as e:
-        print(f"❌ Error loading MaxViT: {e}")
+_maxvit_path_candidates = [
+    MAXVIT_PATH,
+    "./maxvit_kaggle_best.pth",
+    "../maxvit_kaggle_best.pth",
+]
+for _candidate in _maxvit_path_candidates:
+    if os.path.exists(_candidate):
+        try:
+            checkpoint = torch.load(_candidate, map_location=DEVICE)
+            sd = checkpoint.get('model_state_dict', checkpoint.get('sd', checkpoint))
+            model_maxvit.load_state_dict(sd)
+            model_maxvit.to(DEVICE)
+            model_maxvit.eval()
+            weights_loaded["maxvit"] = True
+            print(f"✅ MaxViT weights loaded from {_candidate}.")
+            break
+        except Exception as e:
+            print(f"❌ Error loading MaxViT from {_candidate}: {e}")
 
 # 3. Initialize NextViT
 print("🏗️  Initializing NextViT model...")
