@@ -22,12 +22,27 @@ load_dotenv()
 app = FastAPI(title="TomatoGuard AI Inference Engine")
 
 # ── CLOUDINARY CONFIG ──────────────────────────────────────────
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-    secure=True
+# Only configure Cloudinary when all three credentials are present and valid.
+_cld_name   = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+_cld_key    = os.getenv("CLOUDINARY_API_KEY", "")
+_cld_secret = os.getenv("CLOUDINARY_API_SECRET", "")
+
+is_cloudinary_ready = bool(
+    _cld_name and _cld_name != "your_cloud_name"
+    and _cld_key and _cld_key != "your_api_key"
+    and _cld_secret and _cld_secret != "your_api_secret"
 )
+
+if is_cloudinary_ready:
+    cloudinary.config(
+        cloud_name=_cld_name,
+        api_key=_cld_key,
+        api_secret=_cld_secret,
+        secure=True
+    )
+    print(f"✅ Cloudinary configured for cloud: {_cld_name}")
+else:
+    print("⚠️  Cloudinary not configured — images will be stored as base64.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -518,9 +533,7 @@ async def predict(image: UploadFile = File(...)):
         pred_id = str(uuid.uuid4())
         timestamp = datetime.datetime.now().isoformat()
         persistent_image_url = None
-        is_cloudinary_active = bool(os.getenv("CLOUDINARY_CLOUD_NAME") and os.getenv("CLOUDINARY_CLOUD_NAME") != "your_cloud_name")
-
-        if is_cloudinary_active:
+        if is_cloudinary_ready:
             try:
                 upload_result = cloudinary.uploader.upload(
                     img_data,
@@ -577,7 +590,7 @@ async def predict(image: UploadFile = File(...)):
                 annotated_img.save(annotated_bytes_io, format="JPEG", quality=87)
                 annotated_raw = annotated_bytes_io.getvalue()
 
-                if is_cloudinary_active:
+                if is_cloudinary_ready:
                     # Upload heatmap overlay
                     upload_xai = cloudinary.uploader.upload(
                         overlay_raw,
@@ -595,7 +608,7 @@ async def predict(image: UploadFile = File(...)):
                         tags=["annotated", prediction],
                     )
                     annotated_original_url = upload_ann.get("secure_url")
-                else:
+                else:  # base64 fallback when Cloudinary not configured
                     import base64
                     xai_b64 = base64.b64encode(overlay_raw).decode("utf-8")
                     xai_image_url = f"data:image/jpeg;base64,{xai_b64}"
