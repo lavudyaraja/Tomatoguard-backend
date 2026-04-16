@@ -529,10 +529,12 @@ async def predict(image: UploadFile = File(...)):
         primary_idx = model_results[primary_key]["idx"]
         method = f"dual_model_{primary_key}"
 
-        # ── PERSISTENCE: Save to Cloudinary (fallback to Base64) ──
+        # ── PERSISTENCE: Save image (Cloudinary → Base64 fallback) ──
         pred_id = str(uuid.uuid4())
         timestamp = datetime.datetime.now().isoformat()
         persistent_image_url = None
+
+        # Always try Cloudinary first, fall back to base64 on ANY error
         if is_cloudinary_ready:
             try:
                 upload_result = cloudinary.uploader.upload(
@@ -542,46 +544,55 @@ async def predict(image: UploadFile = File(...)):
                     tags=["tomato_leaf", prediction]
                 )
                 persistent_image_url = upload_result.get("secure_url")
-                print(f"🚀 Image persistent in Cloudinary: {persistent_image_url}")
+                print(f"🚀 Image saved to Cloudinary: {persistent_image_url}")
             except Exception as e:
-                print(f"⚠️ Cloudinary upload failed: {e}")
+                print(f"⚠️ Cloudinary image upload failed (will use base64): {e}")
 
-        # Final Fallback to Base64 if Cloudinary failed/skipped
+        # Always fall back to base64 if Cloudinary was skipped or failed
         if not persistent_image_url:
             try:
-                import base64
-                b64_str = base64.b64encode(img_data).decode("utf-8")
+                import base64 as _b64
+                b64_str = _b64.b64encode(img_data).decode("utf-8")
                 mime_type = image.content_type or "image/jpeg"
                 persistent_image_url = f"data:{mime_type};base64,{b64_str}"
-            except Exception:
+            except Exception as e:
+                print(f"❌ Base64 fallback also failed: {e}")
                 persistent_image_url = None
 
 
-        # ── XAI: Generate Interpretability Heatmap ──
+        # ── XAI: Generate Grad-CAM Interpretability Heatmap ──
         xai_image_url = None
-        annotated_original_url = None      # NEW: original + disease circles
+        annotated_original_url = None
         hotspots = []
 
         if interpretability_engine:
             try:
-                # Target the primary model for XAI
-                xai_model = model_coatnet if primary_key == "coatnet" else model_maxvit
+                import base64 as _b64
+                # Pick the best available loaded model for XAI
+                if primary_key == "coatnet" and weights_loaded.get("coatnet"):
+                    xai_model = model_coatnet
+                elif primary_key == "maxvit" and weights_loaded.get("maxvit"):
+                    xai_model = model_maxvit
+                elif weights_loaded.get("coatnet"):
+                    xai_model = model_coatnet
+                elif weights_loaded.get("maxvit"):
+                    xai_model = model_maxvit
+                else:
+                    raise RuntimeError("No model available for XAI (need CoAtNet or MaxViT)")
+
                 xai_model.train(False)
-                
+
                 heatmap, _ = interpretability_engine.generate_heatmap(
                     input_tensor, class_idx=primary_idx
                 )
 
-                # 1. Detect hotspots from heatmap
+                # Detect hotspots
                 hotspots = interpretability_engine.find_hotspots(heatmap)
 
-                # 2. Heatmap overlay (existing — unchanged)
+                # Build overlay and annotated images
                 overlay_img = apply_heatmap_overlay(img, heatmap, alpha=0.55)
-
-                # 3. NEW: Annotate original with disease spot circles
                 annotated_img = annotate_disease_on_original(img, hotspots, heatmap)
 
-                # ── Upload / base64 both images ──
                 overlay_bytes_io = io.BytesIO()
                 overlay_img.save(overlay_bytes_io, format="JPEG", quality=87)
                 overlay_raw = overlay_bytes_io.getvalue()
@@ -590,34 +601,41 @@ async def predict(image: UploadFile = File(...)):
                 annotated_img.save(annotated_bytes_io, format="JPEG", quality=87)
                 annotated_raw = annotated_bytes_io.getvalue()
 
+                # Always try Cloudinary, always fall back to base64
+                cloudinary_xai_ok = False
                 if is_cloudinary_ready:
-                    # Upload heatmap overlay
-                    upload_xai = cloudinary.uploader.upload(
-                        overlay_raw,
-                        folder="tomatoguard_xai",
-                        public_id=f"xai_{pred_id}",
-                        tags=["xai", prediction],
-                    )
-                    xai_image_url = upload_xai.get("secure_url")
+                    try:
+                        upload_xai = cloudinary.uploader.upload(
+                            overlay_raw,
+                            folder="tomatoguard_xai",
+                            public_id=f"xai_{pred_id}",
+                            tags=["xai", prediction],
+                        )
+                        xai_image_url = upload_xai.get("secure_url")
 
-                    # Upload annotated original
-                    upload_ann = cloudinary.uploader.upload(
-                        annotated_raw,
-                        folder="tomatoguard_annotated",
-                        public_id=f"ann_{pred_id}",
-                        tags=["annotated", prediction],
-                    )
-                    annotated_original_url = upload_ann.get("secure_url")
-                else:  # base64 fallback when Cloudinary not configured
-                    import base64
-                    xai_b64 = base64.b64encode(overlay_raw).decode("utf-8")
+                        upload_ann = cloudinary.uploader.upload(
+                            annotated_raw,
+                            folder="tomatoguard_annotated",
+                            public_id=f"ann_{pred_id}",
+                            tags=["annotated", prediction],
+                        )
+                        annotated_original_url = upload_ann.get("secure_url")
+                        cloudinary_xai_ok = True
+                        print("🚀 XAI images saved to Cloudinary")
+                    except Exception as e:
+                        print(f"⚠️ Cloudinary XAI upload failed (will use base64): {e}")
+
+                # Base64 fallback for XAI if Cloudinary skipped or failed
+                if not cloudinary_xai_ok:
+                    xai_b64 = _b64.b64encode(overlay_raw).decode("utf-8")
                     xai_image_url = f"data:image/jpeg;base64,{xai_b64}"
 
-                    ann_b64 = base64.b64encode(annotated_raw).decode("utf-8")
+                    ann_b64 = _b64.b64encode(annotated_raw).decode("utf-8")
                     annotated_original_url = f"data:image/jpeg;base64,{ann_b64}"
+                    print("✅ XAI images encoded as base64")
 
             except Exception as xai_err:
-                print(f"⚠️ XAI generation failed: {xai_err}")
+                print(f"❌ XAI generation failed: {xai_err}")
 
         # ── Save to DB ──
         if DATABASE_URL:

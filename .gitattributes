@@ -33,3 +33,5 @@ saved_model/**/* filter=lfs diff=lfs merge=lfs -text
 *.zip filter=lfs diff=lfs merge=lfs -text
 *.zst filter=lfs diff=lfs merge=lfs -text
 *tfevents* filter=lfs diff=lfs merge=lfs -text
+best_coatnet_model.pth filter=lfs diff=lfs merge=lfs -text
+maxvit_kaggle_best.pth filter=lfs diff=lfs merge=lfs -text
