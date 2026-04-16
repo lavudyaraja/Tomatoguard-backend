@@ -2,6 +2,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'models'))
+from nextvit import create_nextvit
+
 
 # ======== DropPath Utility ========
 def drop_path(x, drop_prob: float = 0., training: bool = False):
@@ -231,3 +236,21 @@ class MaxViT(nn.Module):
             x = stage(x)
         x = x.flatten(2).mean(dim=2)
         return self.head(self.norm(x))
+
+def create_coatnet(num_classes=11, dropout=0.2, drop_path_rate=0.1):
+    """
+    Creates a CoAtNet model using the timm library.
+    Model: coatnet_0_rw_224 (consistent with the training notebook)
+    """
+    model = timm.create_model(
+        'coatnet_0_rw_224',
+        pretrained=True,
+        num_classes=num_classes,
+        drop_rate=dropout,
+        drop_path_rate=drop_path_rate
+    )
+    return model
+
+
+# Re-export so callers can do: from model import create_nextvit
+__all__ = ["MaxViT", "create_coatnet", "create_nextvit"]

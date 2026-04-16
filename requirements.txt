@@ -7,3 +7,8 @@ psycopg2-binary
 python-dotenv
 python-multipart
 cloudinary
+opencv-python-headless
+matplotlib
+numpy
+scipy
+timm>=1.0.0

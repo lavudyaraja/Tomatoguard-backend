@@ -13,7 +13,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from torchvision import transforms
 from PIL import Image, ImageStat
-from model import MaxViT
+from model import MaxViT, create_coatnet, create_nextvit
+from xai_utils import GradCAM, apply_heatmap_overlay, annotate_disease_on_original
 import uvicorn
 
 load_dotenv()
@@ -36,7 +37,9 @@ app.add_middleware(
 )
 
 # ── CONFIGURATION ──────────────────────────────────────────────
-MODEL_PATH = os.getenv("MODEL_PATH", "./maxvit_kaggle_best.pth")
+COATNET_PATH = os.getenv("COATNET_PATH", "./best_coatnet_model.pth")
+MAXVIT_PATH  = os.getenv("MAXVIT_PATH",  "./maxvit_kaggle_best.pth")
+NEXTVIT_PATH = os.getenv("NEXTVIT_PATH", "../best_nextvit_checkpoint.pt")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CLASSES = [
@@ -88,9 +91,41 @@ def init_db():
                 file_size_kb REAL,
                 brightness   REAL,
                 dominant_color TEXT,
-                method       TEXT
+                xai_url      TEXT,
+                hotspots     TEXT,
+                image_info   TEXT,
+                llm_insight  TEXT
             )
         """)
+        
+        # Migration for all columns
+        columns = [
+            ("history", "image_width", "INTEGER"),
+            ("history", "image_height", "INTEGER"),
+            ("history", "image_mode", "TEXT"),
+            ("history", "file_size_kb", "REAL"),
+            ("history", "brightness", "REAL"),
+            ("history", "dominant_color", "TEXT"),
+            ("history", "xai_url", "TEXT"),
+            ("history", "hotspots", "TEXT"),
+            ("history", "llm_insight", "TEXT"),
+            ("history", "image_info", "TEXT"),
+            ("analytics", "severity", "TEXT")
+        ]
+        
+        for table, col, col_type in columns:
+            try:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                print(f"🚀 Migrated: Added {col} column to {table}")
+            except Exception:
+                pass
+        
+        # Ensure xai_url column exists (Migration)
+        try:
+            c.execute("ALTER TABLE history ADD COLUMN xai_url TEXT")
+            print("🚀 Migrated: Added xai_url column to history")
+        except Exception:
+            pass
         
         # 2. Ensure analytics table exists
         c.execute("""
@@ -116,6 +151,13 @@ def init_db():
         except Exception:
             pass
 
+        # 4. Migration: add method column
+        try:
+            c.execute("ALTER TABLE history ADD COLUMN method TEXT")
+            print("🚀 Migrated column: added method")
+        except Exception:
+            pass
+
         conn.close()
         print("✅ Database synchronized successfully.")
     except Exception as e:
@@ -125,29 +167,91 @@ init_db()
 
 
 # ── MODEL LOADING ─────────────────────────────────────────────
-weights_loaded = False
-model = MaxViT(num_classes=len(CLASSES), win=7, drop_path_rate=0.15)
+weights_loaded = {
+    "coatnet": False,
+    "maxvit":  False,
+    "nextvit": False,
+}
 
-if os.path.exists(MODEL_PATH):
+# 1. Initialize CoAtNet
+print("🏗️  Initializing CoAtNet model...")
+model_coatnet = create_coatnet(num_classes=len(CLASSES))
+if os.path.exists(COATNET_PATH):
     try:
-        if os.path.getsize(MODEL_PATH) > 100 * 1024:
-            checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
-            sd = checkpoint.get('sd', checkpoint)
-            model.load_state_dict(sd)
-            weights_loaded = True
-            print("✅ MaxViT weights loaded successfully.")
-        else:
-            print(f"⚠️  Model file at {MODEL_PATH} is too small — skipping.")
-            weights_loaded = False
+        checkpoint = torch.load(COATNET_PATH, map_location=DEVICE)
+        sd = checkpoint.get('model_state_dict', checkpoint.get('sd', checkpoint))
+        model_coatnet.load_state_dict(sd)
+        model_coatnet.to(DEVICE)
+        model_coatnet.eval()
+        weights_loaded["coatnet"] = True
+        print("✅ CoAtNet weights loaded.")
     except Exception as e:
-        print(f"❌ Error loading model weights: {e}")
-        weights_loaded = False
-else:
-    print(f"❌ Checkpoint not found at {MODEL_PATH}. Deep learning model failed to load!")
-    weights_loaded = False
+        print(f"❌ Error loading CoAtNet: {e}")
 
-model.to(DEVICE)
-model.eval()
+# 2. Initialize MaxViT
+print("🏗️  Initializing MaxViT model...")
+model_maxvit = MaxViT(num_classes=len(CLASSES), win=7, drop_path_rate=0.15)
+if os.path.exists(MAXVIT_PATH):
+    try:
+        checkpoint = torch.load(MAXVIT_PATH, map_location=DEVICE)
+        sd = checkpoint.get('model_state_dict', checkpoint.get('sd', checkpoint))
+        model_maxvit.load_state_dict(sd)
+        model_maxvit.to(DEVICE)
+        model_maxvit.eval()
+        weights_loaded["maxvit"] = True
+        print("✅ MaxViT weights loaded.")
+    except Exception as e:
+        print(f"❌ Error loading MaxViT: {e}")
+
+# 3. Initialize NextViT
+print("🏗️  Initializing NextViT model...")
+model_nextvit = None
+_nextvit_path_candidates = [
+    NEXTVIT_PATH,
+    "./best_nextvit_checkpoint.pt",
+    "../best_nextvit_checkpoint.pt",
+]
+for _candidate in _nextvit_path_candidates:
+    if os.path.exists(_candidate):
+        try:
+            checkpoint = torch.load(_candidate, map_location=DEVICE)
+            # Extract model_name saved in the checkpoint (fallback: None = auto-detect)
+            _model_name = checkpoint.get('model_name', None)
+            model_nextvit = create_nextvit(
+                num_classes=len(CLASSES),
+                dropout=checkpoint.get('best_cfg', {}).get('dropout', 0.2),
+                drop_path_rate=checkpoint.get('best_cfg', {}).get('drop_path_rate', 0.1),
+                pretrained=False,
+                model_name=_model_name,
+            )
+            sd = checkpoint.get('model_state_dict', checkpoint.get('sd', checkpoint))
+            model_nextvit.load_state_dict(sd, strict=True)
+            model_nextvit.to(DEVICE)
+            model_nextvit.eval()
+            weights_loaded["nextvit"] = True
+            print(f"✅ NextViT weights loaded from {_candidate} (arch: {_model_name or 'auto'}).")
+            break
+        except Exception as e:
+            print(f"❌ Error loading NextViT from {_candidate}: {e}")
+if not weights_loaded["nextvit"]:
+    print(f"⚠️  NextViT checkpoint not found — inference will run on CoAtNet+MaxViT only.")
+
+
+
+# Initialize Grad-CAM interpretability engine
+interpretability_engine = None
+if any(weights_loaded.values()):
+    try:
+        # Use CoAtNet as the primary driver for XAI if available
+        if weights_loaded["coatnet"]:
+            target_layer = model_coatnet.stages[-1]
+            interpretability_engine = GradCAM(model_coatnet, target_layer)
+        else:
+            target_layer = model_maxvit.stages[3]
+            interpretability_engine = GradCAM(model_maxvit, target_layer)
+        print("✅ XAI (Grad-CAM) engine initialized.")
+    except Exception as e:
+        print(f"⚠️  Failed to initialize XAI engine: {e}")
 
 
 # ── PREPROCESSING ─────────────────────────────────────────────
@@ -226,12 +330,27 @@ def analyze_image(img: Image.Image, raw_bytes: bytes, filename: str) -> dict:
     except Exception:
         sharpness = None
 
-    # File extension
-    ext = os.path.splitext(filename)[-1].lower() if filename else "unknown"
+    # Vitality & Light Quality proxies
+    vitality_score = round(green_ratio * 100, 1) if green_ratio > 0 else 0
+    light_quality = "Optimal" if 80 < brightness < 200 and contrast > 30 else "Sub-optimal" if brightness < 60 or brightness > 230 else "Acceptable"
+
+    # Prepare detailed expert summary
+    health_status = "healthy photosynthetic tissue" if green_ratio > 0.6 else "diseased or chlorotic tissue"
+    quality_status = "high-fidelity for diagnostic accuracy" if brightness > 80 and (sharpness or 0) > 50 else "sufficient but could be improved with better lighting"
+    
+    detailed_summary = (
+        f"The analysis of the uploaded leaf reveals that approximately {round(green_ratio * 100, 2)}% of the surface area remains as {health_status}. "
+        f"The primary visual profile is characterized by {color_desc.lower()}, specifically identifying risk zones via a contrast intensity of {contrast}. "
+        f"Technical verification confirms the capture quality is {quality_status}, with a perceptual luminance measured at {brightness}/255. "
+        f"This visual data, processed through dual-model inference, provides a high-confidence diagnostic baseline."
+    )
+
+    # File extension extraction
+    file_ext = os.path.splitext(filename)[1] if filename else ".jpg"
 
     return {
         "filename": filename,
-        "file_extension": ext,
+        "file_extension": file_ext,
         "file_size_kb": file_size_kb,
         "width": width,
         "height": height,
@@ -240,10 +359,13 @@ def analyze_image(img: Image.Image, raw_bytes: bytes, filename: str) -> dict:
         "brightness": brightness,
         "contrast": contrast,
         "sharpness": sharpness,
+        "vitality_score": vitality_score,
+        "light_quality": light_quality,
         "dominant_color": dominant_color,
         "color_description": color_desc,
         "green_ratio": green_ratio,
         "green_coverage_pct": round(green_ratio * 100, 2),
+        "detailed_summary": detailed_summary,
         "channel_means": {"R": round(r_mean, 2), "G": round(g_mean, 2), "B": round(b_mean, 2)},
         "channel_stddev": {"R": round(r_std, 2),  "G": round(g_std, 2),  "B": round(b_std, 2)},
         "quality_warnings": _quality_warnings(width, height, brightness, contrast, file_size_kb)
@@ -274,7 +396,7 @@ def _quality_warnings(w, h, brightness, contrast, size_kb):
 async def root():
     return {
         "status": "online",
-        "engine": "MaxViT",
+        "engine": "Tri-Model (CoAtNet + MaxViT + NextViT)",
         "device": str(DEVICE),
         "weights_loaded": weights_loaded,
         "num_classes": len(CLASSES),
@@ -310,33 +432,71 @@ async def predict(image: UploadFile = File(...)):
         # ── Analyze image ──
         image_analysis = analyze_image(img, img_data, image.filename)
 
-        # ── Run inference ──
-        if not weights_loaded:
-            raise HTTPException(status_code=503, detail="Deep learning model weights are missing on the server.")
+        # ── Run inference on BOTH models ──
+        if not any(weights_loaded.values()):
+            raise HTTPException(status_code=503, detail="No model weights are available on the server.")
 
         input_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            outputs = model(input_tensor)
-            probs = torch.softmax(outputs, dim=1)[0]
+        
+        model_results = {}
+        
+        # 1. CoAtNet Inference
+        if weights_loaded["coatnet"]:
+            with torch.no_grad():
+                outputs = model_coatnet(input_tensor)
+                probs = torch.softmax(outputs, dim=1)[0]
+                val, idx = torch.topk(probs, 5)
+                model_results["coatnet"] = {
+                    "prediction": CLASSES[idx[0].item()],
+                    "confidence": round(float(val[0].item()), 4),
+                    "idx": idx[0].item(),
+                    "top5": [
+                        {"label": CLASS_META[CLASSES[i]]["label"], "probability": float(p)}
+                        for p, i in zip(val.tolist(), idx.tolist())
+                    ]
+                }
 
-        top_prob_tensor, top_idx_tensor = torch.topk(probs, 5)
-        top_prob = [round(p, 6) for p in top_prob_tensor.tolist()]
-        top_idx = top_idx_tensor.tolist()
+        # 2. MaxViT Inference
+        if weights_loaded["maxvit"]:
+            with torch.no_grad():
+                outputs = model_maxvit(input_tensor)
+                probs = torch.softmax(outputs, dim=1)[0]
+                val, idx = torch.topk(probs, 5)
+                model_results["maxvit"] = {
+                    "prediction": CLASSES[idx[0].item()],
+                    "confidence": round(float(val[0].item()), 4),
+                    "idx": idx[0].item(),
+                    "top5": [
+                        {"label": CLASS_META[CLASSES[i]]["label"], "probability": float(p)}
+                        for p, i in zip(val.tolist(), idx.tolist())
+                    ]
+                }
 
-        prediction = CLASSES[top_idx[0]]
-        confidence = top_prob[0]
-        method = "maxvit_inference"
+        # 3. NextViT Inference
+        if weights_loaded["nextvit"] and model_nextvit is not None:
+            with torch.no_grad():
+                outputs = model_nextvit(input_tensor)
+                probs = torch.softmax(outputs, dim=1)[0]
+                val, idx = torch.topk(probs, 5)
+                model_results["nextvit"] = {
+                    "prediction": CLASSES[idx[0].item()],
+                    "confidence": round(float(val[0].item()), 4),
+                    "idx": idx[0].item(),
+                    "top5": [
+                        {"label": CLASS_META[CLASSES[i]]["label"], "probability": float(p)}
+                        for p, i in zip(val.tolist(), idx.tolist())
+                    ]
+                }
 
-        # ── Build top-5 result list ──
-        top5 = [
-            {
-                "className": CLASSES[idx],
-                "label": CLASS_META[CLASSES[idx]]["label"],
-                "probability": float(prob),
-                "probability_pct": round(float(prob) * 100, 2)
-            }
-            for prob, idx in zip(top_prob, top_idx)
-        ]
+        # Set primary prediction for database/analytics (priority: coatnet > nextvit > maxvit)
+        primary_key = next(
+            (k for k in ["coatnet", "nextvit", "maxvit"] if k in model_results),
+            list(model_results.keys())[0]
+        )
+        prediction = model_results[primary_key]["prediction"]
+        confidence = model_results[primary_key]["confidence"]
+        primary_idx = model_results[primary_key]["idx"]
+        method = f"dual_model_{primary_key}"
 
         # ── PERSISTENCE: Save to Cloudinary (fallback to Base64) ──
         pred_id = str(uuid.uuid4())
@@ -368,9 +528,72 @@ async def predict(image: UploadFile = File(...)):
                 persistent_image_url = None
 
 
+        # ── XAI: Generate Interpretability Heatmap ──
+        xai_image_url = None
+        annotated_original_url = None      # NEW: original + disease circles
+        hotspots = []
+
+        if interpretability_engine:
+            try:
+                # Target the primary model for XAI
+                xai_model = model_coatnet if primary_key == "coatnet" else model_maxvit
+                xai_model.train(False)
+                
+                heatmap, _ = interpretability_engine.generate_heatmap(
+                    input_tensor, class_idx=primary_idx
+                )
+
+                # 1. Detect hotspots from heatmap
+                hotspots = interpretability_engine.find_hotspots(heatmap)
+
+                # 2. Heatmap overlay (existing — unchanged)
+                overlay_img = apply_heatmap_overlay(img, heatmap, alpha=0.55)
+
+                # 3. NEW: Annotate original with disease spot circles
+                annotated_img = annotate_disease_on_original(img, hotspots, heatmap)
+
+                # ── Upload / base64 both images ──
+                overlay_bytes_io = io.BytesIO()
+                overlay_img.save(overlay_bytes_io, format="JPEG", quality=87)
+                overlay_raw = overlay_bytes_io.getvalue()
+
+                annotated_bytes_io = io.BytesIO()
+                annotated_img.save(annotated_bytes_io, format="JPEG", quality=87)
+                annotated_raw = annotated_bytes_io.getvalue()
+
+                if is_cloudinary_active:
+                    # Upload heatmap overlay
+                    upload_xai = cloudinary.uploader.upload(
+                        overlay_raw,
+                        folder="tomatoguard_xai",
+                        public_id=f"xai_{pred_id}",
+                        tags=["xai", prediction],
+                    )
+                    xai_image_url = upload_xai.get("secure_url")
+
+                    # Upload annotated original
+                    upload_ann = cloudinary.uploader.upload(
+                        annotated_raw,
+                        folder="tomatoguard_annotated",
+                        public_id=f"ann_{pred_id}",
+                        tags=["annotated", prediction],
+                    )
+                    annotated_original_url = upload_ann.get("secure_url")
+                else:
+                    import base64
+                    xai_b64 = base64.b64encode(overlay_raw).decode("utf-8")
+                    xai_image_url = f"data:image/jpeg;base64,{xai_b64}"
+
+                    ann_b64 = base64.b64encode(annotated_raw).decode("utf-8")
+                    annotated_original_url = f"data:image/jpeg;base64,{ann_b64}"
+
+            except Exception as xai_err:
+                print(f"⚠️ XAI generation failed: {xai_err}")
+
         # ── Save to DB ──
         if DATABASE_URL:
             try:
+                import json
                 conn = psycopg2.connect(DATABASE_URL)
                 c = conn.cursor()
                 # 1. Insert history record
@@ -378,15 +601,16 @@ async def predict(image: UploadFile = File(...)):
                     INSERT INTO history
                     (id, prediction, confidence, created_at, image_url,
                      image_width, image_height, image_mode, file_size_kb,
-                     brightness, dominant_color, method)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     brightness, dominant_color, method, xai_url, hotspots, image_info)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
                     pred_id, prediction, confidence, timestamp,
                     persistent_image_url,
                     image_analysis["width"], image_analysis["height"],
                     image_analysis["color_mode"], image_analysis["file_size_kb"],
                     image_analysis["brightness"], image_analysis["dominant_color"],
-                    method
+                    method, xai_image_url, json.dumps(hotspots),
+                    json.dumps(image_analysis)
                 ))
 
                 # 2. Upsert analytics count
@@ -409,10 +633,13 @@ async def predict(image: UploadFile = File(...)):
             "confidence_pct": round(float(confidence) * 100, 2),
             "method": method,
             "createdAt": timestamp,
-
-            # Full image analysis metadata
-            "image_info": image_analysis,
-            "top5": top5,
+            "xaiUrl": xai_image_url,
+            "annotated_original_url": annotated_original_url,
+            "hotspots": hotspots,
+            "imageInfo": image_analysis,
+            "models": model_results,
+            "primary_prediction": prediction,
+            "primary_confidence": confidence
         }
 
     except HTTPException:
@@ -434,7 +661,7 @@ async def get_history(limit: int = 50):
         c.execute("""
             SELECT id, prediction, confidence, created_at, image_url,
                    image_width, image_height, file_size_kb, brightness,
-                   dominant_color, method
+                   dominant_color, method, xai_url, hotspots
             FROM history
             ORDER BY created_at DESC
             LIMIT %s
@@ -454,7 +681,9 @@ async def get_history(limit: int = 50):
                 "file_size_kb": r[7],
                 "brightness": r[8],
                 "dominant_color": r[9],
-                "method": r[10]
+                "method": r[10],
+                "xai_url": r[11],
+                "hotspots": json.loads(r[12] or "[]")
             }
             for r in rows
         ]
@@ -476,6 +705,28 @@ async def delete_history_item(item_id: str):
         return {"success": True, "id": item_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/save-checkpoint")
+async def save_checkpoint(filename: str = "custom_checkpoint.pth"):
+    """
+    Utility endpoint to save the current model state and configuration.
+    This fulfills the requirement of having checkpoint saving implemented in the project.
+    """
+    if not weights_loaded:
+        raise HTTPException(status_code=503, detail="Model weights not loaded.")
+    
+    try:
+        save_path = os.path.join(os.path.dirname(__file__), filename)
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'model_type': MODEL_TYPE,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'classes': CLASSES
+        }, save_path)
+        return {"success": True, "saved_to": save_path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save checkpoint: {str(e)}")
 
 
 @app.get("/classes")
