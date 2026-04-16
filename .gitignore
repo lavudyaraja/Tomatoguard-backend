@@ -12,10 +12,9 @@ ENV/
 env.bak
 venv.bak
 
-# Model weights (Large files should be ignored if not using LFS)
-*.pth
-*.h5
-*.weights
+# Model weights are tracked via Git LFS — do NOT ignore them here
+# *.pth -> handled by .gitattributes (LFS)
+# *.pt  -> handled by .gitattributes (LFS)
 
 # Distribution / packaging
 dist/
